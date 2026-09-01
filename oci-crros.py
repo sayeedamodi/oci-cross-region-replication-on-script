@@ -1,209 +1,205 @@
 #!/usr/bin/env python3
 
 import argparse
-import oci
 import sys
-import json
-from datetime import datetime
+import oci
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Enable OCI Cross-Region Replication for Block and Boot Volumes"
+        description="OCI Cross-Region Replication for Block and Boot Volumes"
     )
 
     parser.add_argument(
-    "--profile",
-    default="DEFAULT",
-    help="OCI config profile to use"
-  )  
-
-    parser.add_argument(
-        "--compartments",
-        nargs="+",
+        "--compartments-file",
         required=True,
-        help="One or more compartment OCIDs"
+        help="TXT file containing compartment OCIDs, one per line"
     )
 
     parser.add_argument(
         "--destination-region",
         required=True,
-        help="Destination OCI region, for example ap-mumbai-1"
+        help="Destination OCI region, e.g. ap-mumbai-1"
     )
 
     parser.add_argument(
         "--destination-ad",
         required=True,
-        help="Destination Availability Domain name"
+        help="Destination Availability Domain"
     )
 
     parser.add_argument(
         "--source-region",
-        default=None,
-        help="Source region. Defaults to OCI config region."
+        help="Source OCI region. Defaults to region in OCI profile."
+    )
+
+    parser.add_argument(
+        "--profile",
+        default="DEFAULT",
+        help="OCI config profile. Default: DEFAULT"
     )
 
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would happen without making changes"
+        help="Show what would be changed without making changes"
     )
 
     parser.add_argument(
         "--volume-id",
-        default=None,
         help="Optional: process only this volume OCID"
     )
 
     return parser.parse_args()
 
 
-def get_clients(config, source_region):
+def load_compartments(filename):
+    compartments = []
 
-    identity_client = oci.identity.IdentityClient(config)
+    try:
+        with open(filename, "r") as file:
+            for line in file:
+                line = line.strip()
 
-    blockstorage_client = oci.core.BlockstorageClient(config)
+                # Ignore blank lines
+                if not line:
+                    continue
 
-    bootvolume_client = oci.core.BlockstorageClient(config)
+                # Ignore comments
+                if line.startswith("#"):
+                    continue
 
-    return (
-        identity_client,
-        blockstorage_client,
-        bootvolume_client
-    )
+                compartments.append(line)
+
+    except FileNotFoundError:
+        print(f"[ERROR] Compartment file not found: {filename}")
+        sys.exit(1)
+
+    if not compartments:
+        print("[ERROR] No compartment OCIDs found in file.")
+        sys.exit(1)
+
+    return compartments
 
 
 def get_compartment_name(identity_client, compartment_id):
-
     try:
-        compartment = identity_client.get_compartment(
+        response = identity_client.get_compartment(
             compartment_id
-        ).data
+        )
 
-        return compartment.name
+        return response.data.name
 
     except Exception:
         return compartment_id
 
 
 def get_block_volumes(blockstorage_client, compartment_id):
-
-    volumes = []
-
     try:
-
         response = oci.pagination.list_call_get_all_results(
             blockstorage_client.list_volumes,
             compartment_id=compartment_id
         )
 
-        volumes = response.data
+        return response.data
 
     except Exception as e:
-
         print(
             f"[ERROR] Failed to list block volumes "
             f"in {compartment_id}: {e}"
         )
 
-    return volumes
+        return []
 
 
 def get_boot_volumes(blockstorage_client, compartment_id):
-
-    volumes = []
-
     try:
-
         response = oci.pagination.list_call_get_all_results(
             blockstorage_client.list_boot_volumes,
             compartment_id=compartment_id
         )
 
-        volumes = response.data
+        return response.data
 
     except Exception as e:
-
         print(
             f"[ERROR] Failed to list boot volumes "
             f"in {compartment_id}: {e}"
         )
 
-    return volumes
+        return []
 
 
-def get_existing_replicas(volume):
-
-    """
-    Return existing replication configuration.
-
-    OCI SDK model fields can vary slightly by SDK version,
-    so use getattr safely.
-    """
-
-    replicas = getattr(
+def get_block_replicas(volume):
+    return getattr(
         volume,
         "block_volume_replicas",
+        []
+    ) or []
+
+
+def get_boot_replicas(volume):
+    return getattr(
+        volume,
+        "boot_volume_replicas",
+        []
+    ) or []
+
+
+def replica_matches_destination(replica, destination_region, destination_ad):
+    replica_region = getattr(
+        replica,
+        "region",
         None
     )
 
-    if replicas is None:
+    replica_ad = getattr(
+        replica,
+        "availability_domain",
+        None
+    )
 
-        replicas = getattr(
-            volume,
-            "boot_volume_replicas",
-            None
-        )
+    # Some OCI responses identify the destination through
+    # the availability domain. Check both where available.
+    if replica_region == destination_region:
+        return True
 
-    return replicas or []
+    if replica_ad == destination_ad:
+        return True
 
-
-def find_destination_replica(
-    volume,
-    destination_region
-):
-
-    replicas = get_existing_replicas(volume)
-
-    for replica in replicas:
-
-        replica_region = getattr(
-            replica,
-            "region",
-            None
-        )
-
-        if replica_region == destination_region:
-
-            return replica
-
-    return None
+    return False
 
 
-def print_volume(volume, volume_type):
-
+def print_volume_info(volume, volume_type, replicas):
     print()
     print("-" * 70)
 
     print(f"Type       : {volume_type}")
     print(f"Name       : {volume.display_name}")
     print(f"OCID       : {volume.id}")
-    print(f"Size GB    : {getattr(volume, 'size_in_gbs', 'N/A')}")
-    print(f"State      : {getattr(volume, 'lifecycle_state', 'N/A')}")
-
-    replicas = get_existing_replicas(volume)
-
+    print(
+        f"Size GB    : "
+        f"{getattr(volume, 'size_in_gbs', 'N/A')}"
+    )
+    print(
+        f"State      : "
+        f"{getattr(volume, 'lifecycle_state', 'N/A')}"
+    )
     print(f"Replicas   : {len(replicas)}")
 
     for replica in replicas:
+        print(
+            f"  Replica AD     : "
+            f"{getattr(replica, 'availability_domain', 'N/A')}"
+        )
 
         print(
-            f"  -> Region : "
+            f"  Replica Region : "
             f"{getattr(replica, 'region', 'N/A')}"
         )
 
         print(
-            f"  -> State  : "
+            f"  Replica State  : "
             f"{getattr(replica, 'lifecycle_state', 'N/A')}"
         )
 
@@ -216,23 +212,27 @@ def enable_block_replication(
     dry_run
 ):
 
-    existing = find_destination_replica(
-        volume,
-        destination_region
-    )
+    replicas = get_block_replicas(volume)
 
-    if existing:
+    for replica in replicas:
 
-        print(
-            f"[SKIP] Block Volume: {volume.display_name}"
-        )
+        if replica_matches_destination(
+            replica,
+            destination_region,
+            destination_ad
+        ):
 
-        print(
-            f"       Already has replica in "
-            f"{destination_region}"
-        )
+            print(
+                f"[SKIP] Block Volume: "
+                f"{volume.display_name}"
+            )
 
-        return "skipped"
+            print(
+                f"       Replica already exists "
+                f"in requested destination."
+            )
+
+            return "skipped"
 
     print(
         f"[ENABLE] Block Volume: "
@@ -262,21 +262,21 @@ def enable_block_replication(
         replica_details = [
             oci.core.models.BlockVolumeReplicaDetails(
                 availability_domain=destination_ad,
-                region=destination_region
+                xrr_kms_key_id=None
             )
         ]
 
-        details = oci.core.models.UpdateVolumeDetails(
+        update_details = oci.core.models.UpdateVolumeDetails(
             block_volume_replicas=replica_details
         )
 
         blockstorage_client.update_volume(
             volume.id,
-            details
+            update_details
         )
 
         print(
-            "         SUCCESS - replication enabled"
+            "         SUCCESS - replication request submitted"
         )
 
         return "enabled"
@@ -298,23 +298,27 @@ def enable_boot_replication(
     dry_run
 ):
 
-    existing = find_destination_replica(
-        volume,
-        destination_region
-    )
+    replicas = get_boot_replicas(volume)
 
-    if existing:
+    for replica in replicas:
 
-        print(
-            f"[SKIP] Boot Volume: {volume.display_name}"
-        )
+        if replica_matches_destination(
+            replica,
+            destination_region,
+            destination_ad
+        ):
 
-        print(
-            f"       Already has replica in "
-            f"{destination_region}"
-        )
+            print(
+                f"[SKIP] Boot Volume: "
+                f"{volume.display_name}"
+            )
 
-        return "skipped"
+            print(
+                f"       Replica already exists "
+                f"in requested destination."
+            )
+
+            return "skipped"
 
     print(
         f"[ENABLE] Boot Volume: "
@@ -344,21 +348,21 @@ def enable_boot_replication(
         replica_details = [
             oci.core.models.BootVolumeReplicaDetails(
                 availability_domain=destination_ad,
-                region=destination_region
+                xrr_kms_key_id=None
             )
         ]
 
-        details = oci.core.models.UpdateBootVolumeDetails(
+        update_details = oci.core.models.UpdateBootVolumeDetails(
             boot_volume_replicas=replica_details
         )
 
         blockstorage_client.update_boot_volume(
             volume.id,
-            details
+            update_details
         )
 
         print(
-            "         SUCCESS - replication enabled"
+            "         SUCCESS - replication request submitted"
         )
 
         return "enabled"
@@ -376,13 +380,33 @@ def main():
 
     args = parse_args()
 
+    print()
     print("=" * 70)
-    print("OCI CROSS-REGION REPLICATION TOOL")
+    print("OCI CROSS-REGION REPLICATION")
     print("=" * 70)
 
-    config = oci.config.from_file(
-      profile_name=args.profile
-    )
+    # ---------------------------------------------------------
+    # Load OCI profile
+    # ---------------------------------------------------------
+
+    try:
+
+        config = oci.config.from_file(
+            profile_name=args.profile
+        )
+
+    except Exception as e:
+
+        print(
+            f"[ERROR] Failed to load OCI profile "
+            f"'{args.profile}': {e}"
+        )
+
+        sys.exit(1)
+
+    # ---------------------------------------------------------
+    # Source region
+    # ---------------------------------------------------------
 
     source_region = (
         args.source_region
@@ -392,35 +416,58 @@ def main():
 
     config["region"] = source_region
 
-    print(f"Source Region      : {source_region}")
-    print(f"Destination Region : {args.destination_region}")
-    print(f"Destination AD     : {args.destination_ad}")
+    # ---------------------------------------------------------
+    # Load compartments
+    # ---------------------------------------------------------
+
+    compartments = load_compartments(
+        args.compartments_file
+    )
+
+    print(f"Profile             : {args.profile}")
+    print(f"Source Region       : {source_region}")
+    print(
+        f"Destination Region  : "
+        f"{args.destination_region}"
+    )
+    print(
+        f"Destination AD      : "
+        f"{args.destination_ad}"
+    )
+    print(
+        f"Compartments File   : "
+        f"{args.compartments_file}"
+    )
+    print(
+        f"Compartments        : "
+        f"{len(compartments)}"
+    )
 
     if args.dry_run:
-
-        print("Mode               : DRY RUN")
-
+        print("Mode                : DRY RUN")
     else:
-
-        print("Mode               : APPLY")
-
-    print(
-        f"Compartments       : "
-        f"{len(args.compartments)}"
-    )
+        print("Mode                : APPLY")
 
     print("=" * 70)
 
-    (
-        identity_client,
-        blockstorage_client,
-        bootvolume_client
-    ) = get_clients(
-        config,
-        source_region
+    # ---------------------------------------------------------
+    # OCI clients
+    # ---------------------------------------------------------
+
+    identity_client = oci.identity.IdentityClient(
+        config
     )
 
+    blockstorage_client = oci.core.BlockstorageClient(
+        config
+    )
+
+    # ---------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------
+
     summary = {
+        "compartments": 0,
         "block_found": 0,
         "boot_found": 0,
         "enabled": 0,
@@ -429,7 +476,13 @@ def main():
         "failed": 0
     }
 
-    for compartment_id in args.compartments:
+    # ---------------------------------------------------------
+    # Process compartments
+    # ---------------------------------------------------------
+
+    for compartment_id in compartments:
+
+        summary["compartments"] += 1
 
         compartment_name = get_compartment_name(
             identity_client,
@@ -438,20 +491,17 @@ def main():
 
         print()
         print("#" * 70)
-
         print(
             f"COMPARTMENT: {compartment_name}"
         )
-
         print(
-            f"OCID: {compartment_id}"
+            f"OCID       : {compartment_id}"
         )
-
         print("#" * 70)
 
-        # --------------------------------------------------
+        # =====================================================
         # BLOCK VOLUMES
-        # --------------------------------------------------
+        # =====================================================
 
         print()
         print("Scanning Block Volumes...")
@@ -475,9 +525,14 @@ def main():
 
             summary["block_found"] += 1
 
-            print_volume(
+            replicas = get_block_replicas(
+                volume
+            )
+
+            print_volume_info(
                 volume,
-                "BLOCK"
+                "BLOCK",
+                replicas
             )
 
             result = enable_block_replication(
@@ -500,9 +555,9 @@ def main():
             elif result == "failed":
                 summary["failed"] += 1
 
-        # --------------------------------------------------
+        # =====================================================
         # BOOT VOLUMES
-        # --------------------------------------------------
+        # =====================================================
 
         print()
         print("Scanning Boot Volumes...")
@@ -526,9 +581,14 @@ def main():
 
             summary["boot_found"] += 1
 
-            print_volume(
+            replicas = get_boot_replicas(
+                volume
+            )
+
+            print_volume_info(
                 volume,
-                "BOOT"
+                "BOOT",
+                replicas
             )
 
             result = enable_boot_replication(
@@ -551,9 +611,9 @@ def main():
             elif result == "failed":
                 summary["failed"] += 1
 
-    # --------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------
+    # ---------------------------------------------------------
+    # Final summary
+    # ---------------------------------------------------------
 
     print()
     print("=" * 70)
@@ -561,32 +621,37 @@ def main():
     print("=" * 70)
 
     print(
-        f"Block volumes found : "
+        f"Compartments scanned : "
+        f"{summary['compartments']}"
+    )
+
+    print(
+        f"Block volumes found  : "
         f"{summary['block_found']}"
     )
 
     print(
-        f"Boot volumes found  : "
+        f"Boot volumes found   : "
         f"{summary['boot_found']}"
     )
 
     print(
-        f"Replication enabled : "
+        f"Replication enabled  : "
         f"{summary['enabled']}"
     )
 
     print(
-        f"Already replicated  : "
+        f"Already replicated   : "
         f"{summary['skipped']}"
     )
 
     print(
-        f"Dry-run operations  : "
+        f"Dry-run operations   : "
         f"{summary['dry_run']}"
     )
 
     print(
-        f"Failed              : "
+        f"Failed               : "
         f"{summary['failed']}"
     )
 
@@ -596,19 +661,16 @@ def main():
 if __name__ == "__main__":
 
     try:
-
         main()
 
     except KeyboardInterrupt:
 
-        print("\nInterrupted.")
-
+        print()
+        print("Interrupted by user.")
         sys.exit(1)
 
     except Exception as e:
 
-        print(
-            f"\nFATAL ERROR: {e}"
-        )
-
+        print()
+        print(f"FATAL ERROR: {e}")
         sys.exit(1)
